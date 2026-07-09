@@ -160,6 +160,18 @@ pond schedule status
 pond schedule logs
 ```
 
+### Live watch
+
+Back up sessions within seconds of being written, instead of waiting for the next scheduled tick (launchd on macOS, a systemd user service on Linux - no cron fallback, since this is a resident daemon, not an interval job):
+
+```sh
+pond watch start                   # incremental no-embed sync on every write
+pond watch status
+pond watch logs
+```
+
+Watch skips embedding for speed (full-text search sees new messages immediately; run `pond optimize` or let `pond schedule` catch up for semantic search). Full guide: [`docs/watch.md`](docs/watch.md).
+
 ### Status and introspection
 
 `pond status` prints a per-table storage table, then `indexes` (text/semantic readiness), `stored` (sessions + messages), `agents` (source agents in the store), and this host's view of it: per-adapter sessions pending sync, the last sync's outcome (including a surfaced failure from a scheduled run), and the next scheduled run. `pond status --hosts` breaks a shared store down by ingest host; `--include-subagents` counts each subagent as its own agent. `pond sync --dry-run` previews what the next sync would read. `pond search --explain` returns Lance's `analyze_plan` output for each retrieval arm.
