@@ -162,11 +162,28 @@ header h1 { font-size: 1.1rem; margin: 0 0 0.25rem; }
 }
 .thinking-label { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-muted); margin-bottom: 0.3rem; }
 .tool-block {
-  background: var(--tool-bg); border-radius: var(--radius); padding: 0.6rem 0.8rem;
-  margin: 0.4rem 0; font-family: var(--font-mono); font-size: 0.82rem; white-space: pre-wrap; word-wrap: break-word;
+  background: var(--tool-bg); border-radius: var(--radius); margin: 0.4rem 0;
+  font-family: var(--font-mono); font-size: 0.82rem;
 }
 .tool-block.failed { background: var(--tool-fail-bg); }
-.tool-block-header { font-weight: 600; margin-bottom: 0.3rem; }
+.tool-block > summary, .system-block > summary {
+  cursor: pointer; user-select: none; list-style: none; font-weight: 600;
+  padding: 0.6rem 0.8rem; display: flex; align-items: center; gap: 0.45rem;
+}
+.tool-block > summary::-webkit-details-marker, .system-block > summary::-webkit-details-marker { display: none; }
+.tool-block > summary::before, .system-block > summary::before {
+  content: "\25b8"; font-size: 0.65rem; color: var(--text-muted); flex: none;
+}
+.tool-block[open] > summary::before, .system-block[open] > summary::before { content: "\25be"; }
+.tool-block-body { white-space: pre-wrap; word-wrap: break-word; padding: 0 0.8rem 0.7rem; }
+.system-block {
+  background: var(--bg-inset); border-radius: var(--radius); margin: 0.4rem 0; font-size: 0.85rem;
+}
+.system-block > summary {
+  font-weight: 400; color: var(--text-muted); font-size: 0.72rem;
+  text-transform: uppercase; letter-spacing: 0.04em;
+}
+.system-block .text-block { padding: 0 0.8rem 0.7rem; }
 .file-block, .approval-block {
   background: var(--bg-inset); border-radius: var(--radius); padding: 0.5rem 0.8rem;
   margin: 0.4rem 0; font-size: 0.82rem; color: var(--text-secondary);
@@ -233,7 +250,12 @@ fn render_message(out: &mut String, message: &MessageWithParts, max_inline_image
     if let Some(content) = message.message.system_content()
         && !content.trim().is_empty()
     {
-        let _ = writeln!(out, "<div class=\"text-block\">{}</div>", escape_html(content));
+        let _ = writeln!(
+            out,
+            "<details class=\"system-block\"><summary>System prompt</summary>\
+             <div class=\"text-block\">{}</div></details>",
+            escape_html(content),
+        );
     }
     for part in &message.parts {
         render_part(out, &part.kind, max_inline_image_bytes);
@@ -273,7 +295,8 @@ fn render_part(out: &mut String, kind: &PartKind, max_inline_image_bytes: usize)
             let body = value_to_text(params);
             let _ = writeln!(
                 out,
-                "<div class=\"tool-block\"><div class=\"tool-block-header\">&rarr; {} [{}]</div>{}</div>",
+                "<details class=\"tool-block\"><summary>&rarr; {} [{}]</summary>\
+                 <div class=\"tool-block-body\">{}</div></details>",
                 escape_html(name),
                 escape_html(call_id),
                 escape_html(&body),
@@ -288,11 +311,16 @@ fn render_part(out: &mut String, kind: &PartKind, max_inline_image_bytes: usize)
             let name = extracted_str(name).unwrap_or("?");
             let call_id = extracted_str(call_id).unwrap_or("?");
             let status = if *is_failure { "failed" } else { "ok" };
-            let class = if *is_failure { "tool-block failed" } else { "tool-block" };
+            let class = if *is_failure {
+                "tool-block failed"
+            } else {
+                "tool-block"
+            };
             let body = value_to_text(result);
             let _ = writeln!(
                 out,
-                "<div class=\"{class}\"><div class=\"tool-block-header\">&larr; {} [{}] ({status})</div>{}</div>",
+                "<details class=\"{class}\"><summary>&larr; {} [{}] ({status})</summary>\
+                 <div class=\"tool-block-body\">{}</div></details>",
                 escape_html(name),
                 escape_html(call_id),
                 escape_html(&body),
@@ -302,7 +330,13 @@ fn render_part(out: &mut String, kind: &PartKind, max_inline_image_bytes: usize)
             media_type,
             file_name,
             data,
-        } => render_file_part(out, media_type.as_deref(), file_name.as_deref(), data, max_inline_image_bytes),
+        } => render_file_part(
+            out,
+            media_type.as_deref(),
+            file_name.as_deref(),
+            data,
+            max_inline_image_bytes,
+        ),
         PartKind::ToolApprovalRequest { approval_id, .. } => {
             let _ = writeln!(
                 out,
@@ -355,7 +389,11 @@ fn render_file_part(
             );
         }
         _ => {
-            let _ = writeln!(out, "<div class=\"file-block\">[file {}]</div>", escape_html(label));
+            let _ = writeln!(
+                out,
+                "<div class=\"file-block\">[file {}]</div>",
+                escape_html(label)
+            );
         }
     }
 }
@@ -502,12 +540,61 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_and_result_render_as_collapsed_details() {
+        let parts = vec![
+            part(serde_json::json!({
+                "type": "tool_call", "name": "apply_patch", "call_id": "toolu_y",
+                "params": {"patch": "diff --git a b"}, "provider_executed": false,
+            })),
+            part(serde_json::json!({
+                "type": "tool_result", "name": "exec_command", "call_id": "toolu_z",
+                "is_failure": false, "result": "ok\n",
+            })),
+        ];
+        let renderer = HtmlRenderer::new();
+        let html =
+            String::from_utf8(renderer.render(&session_with_parts(parts)).unwrap().bytes).unwrap();
+        assert!(html.contains("<details class=\"tool-block\"><summary>&rarr; apply_patch"));
+        assert!(html.contains("<details class=\"tool-block\"><summary>&larr; exec_command"));
+        assert!(!html.contains(" open>"));
+        assert!(html.contains("<div class=\"tool-block-body\">"));
+    }
+
+    #[test]
+    fn failed_tool_result_keeps_failed_class_on_details() {
+        let parts = vec![part(serde_json::json!({
+            "type": "tool_result", "name": "Bash", "call_id": "toolu_x",
+            "is_failure": true, "result": "boom",
+        }))];
+        let renderer = HtmlRenderer::new();
+        let html =
+            String::from_utf8(renderer.render(&session_with_parts(parts)).unwrap().bytes).unwrap();
+        assert!(html.contains("<details class=\"tool-block failed\">"));
+    }
+
+    #[test]
+    fn system_prompt_renders_as_collapsed_details() {
+        let session_id = "s1";
+        let mut session = session_with_parts(vec![]);
+        session.messages[0].message = serde_json::from_value(serde_json::json!({
+            "role": "system", "id": "m0", "session_id": session_id,
+            "timestamp": ts(), "content": "You are a helpful assistant.",
+        }))
+        .unwrap();
+        let renderer = HtmlRenderer::new();
+        let html = String::from_utf8(renderer.render(&session).unwrap().bytes).unwrap();
+        assert!(html.contains("<details class=\"system-block\"><summary>System prompt</summary>"));
+        assert!(html.contains("You are a helpful assistant."));
+    }
+
+    #[test]
     fn reasoning_part_renders_thinking_block() {
         let parts = vec![part(
             serde_json::json!({"type": "reasoning", "text": "thinking it through"}),
         )];
         let renderer = HtmlRenderer::new();
-        let html = String::from_utf8(renderer.render(&session_with_parts(parts)).unwrap().bytes).unwrap();
+        let html =
+            String::from_utf8(renderer.render(&session_with_parts(parts)).unwrap().bytes).unwrap();
         assert!(html.contains("thinking-block"));
         assert!(html.contains("thinking it through"));
     }
@@ -519,7 +606,8 @@ mod tests {
             "data": {"kind": "string", "value": "aGVsbG8="},
         }))];
         let renderer = HtmlRenderer::new();
-        let html = String::from_utf8(renderer.render(&session_with_parts(parts)).unwrap().bytes).unwrap();
+        let html =
+            String::from_utf8(renderer.render(&session_with_parts(parts)).unwrap().bytes).unwrap();
         assert!(html.contains("<img src=\"data:image/png;base64,aGVsbG8=\""));
     }
 
@@ -530,7 +618,8 @@ mod tests {
             "data": {"kind": "bytes", "value": [104, 101, 108, 108, 111]},
         }))];
         let renderer = HtmlRenderer::new();
-        let html = String::from_utf8(renderer.render(&session_with_parts(parts)).unwrap().bytes).unwrap();
+        let html =
+            String::from_utf8(renderer.render(&session_with_parts(parts)).unwrap().bytes).unwrap();
         let expected = STANDARD.encode(b"hello");
         assert!(html.contains(&format!("<img src=\"data:image/png;base64,{expected}\"")));
     }
@@ -542,7 +631,8 @@ mod tests {
             "data": {"kind": "url", "value": "https://example.com/a.png"},
         }))];
         let renderer = HtmlRenderer::new();
-        let html = String::from_utf8(renderer.render(&session_with_parts(parts)).unwrap().bytes).unwrap();
+        let html =
+            String::from_utf8(renderer.render(&session_with_parts(parts)).unwrap().bytes).unwrap();
         assert!(html.contains("<img src=\"https://example.com/a.png\""));
         assert!(!html.contains("data:image"));
     }
@@ -555,7 +645,8 @@ mod tests {
             "data": {"kind": "string", "value": big},
         }))];
         let renderer = HtmlRenderer::with_max_inline_image_bytes(10);
-        let html = String::from_utf8(renderer.render(&session_with_parts(parts)).unwrap().bytes).unwrap();
+        let html =
+            String::from_utf8(renderer.render(&session_with_parts(parts)).unwrap().bytes).unwrap();
         assert!(!html.contains("<img"));
         assert!(html.contains("big.png"));
         assert!(html.contains("omitted"));
@@ -568,7 +659,8 @@ mod tests {
             "data": {"kind": "url", "value": "https://example.com/clip.mp3"},
         }))];
         let renderer = HtmlRenderer::new();
-        let html = String::from_utf8(renderer.render(&session_with_parts(parts)).unwrap().bytes).unwrap();
+        let html =
+            String::from_utf8(renderer.render(&session_with_parts(parts)).unwrap().bytes).unwrap();
         assert!(html.contains("clip.mp3"));
         assert!(html.contains("not yet rendered"));
         assert!(!html.contains("<audio"));
@@ -581,7 +673,8 @@ mod tests {
             "data": {"kind": "url", "value": "https://example.com/doc.pdf"},
         }))];
         let renderer = HtmlRenderer::new();
-        let html = String::from_utf8(renderer.render(&session_with_parts(parts)).unwrap().bytes).unwrap();
+        let html =
+            String::from_utf8(renderer.render(&session_with_parts(parts)).unwrap().bytes).unwrap();
         assert!(html.contains("[file doc.pdf]"));
     }
 }
