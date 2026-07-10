@@ -123,15 +123,18 @@ pond copy --from snapshot.pond --to local
 
 ### Share a session
 
-Publish one session's full transcript as a self-contained HTML page to a public link. No redaction is applied - it requires `--yes` or an interactive confirm that says so plainly:
+Publish one session's full transcript as a self-contained HTML page to a link. No redaction is applied - it requires `--yes` or an interactive confirm that says so plainly:
 
 ```sh
 pond share <session-id>                             # confirm interactively, publish to [share].bucket
 pond share <session-id> --yes --open                # skip the prompt, open the URL in a browser
 pond share <session-id> --to s3://bucket/shares     # publish to an ad-hoc destination
+pond share <session-id> --expires-hours 6           # shorter presigned link than the 48h default
 ```
 
-Needs a `[share]` bucket configured (see `pond config schema`) or an ad-hoc `--to <url>`; publishing credentials resolve the same way as any other storage address, so a separate `[creds.share]` set keeps them apart from your data-store credentials.
+Needs a `[share]` bucket configured (see `pond config schema`) or an ad-hoc `--to <url>`; publishing credentials resolve the same way as any other storage address, so a separate `[creds.share]` set keeps them apart from your data-store credentials. The bucket doesn't need to be public: by default `pond share` prints a presigned URL valid for 48h (`[share].presign_expiry_hours` / `--expires-hours`), so anyone with the link can view it without the bucket itself granting public read. Set `[share].public_base_url` instead if you'd rather front a genuinely public bucket with a permanent, non-expiring link.
+
+From inside Claude Code mid-session: install `integrations/claude-code/commands/pshare.md` as `/pshare` and publish without leaving the conversation. Full guide: [`docs/claude-code-share.md`](docs/claude-code-share.md).
 
 ### Read-only SQL
 

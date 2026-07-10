@@ -2,9 +2,9 @@
 source: src/main.rs
 expression: sub.render_long_help().to_string()
 ---
-Publish one session's transcript to a public link.
+Publish one session's transcript to a link.
 
-Renders the session as a self-contained HTML page and writes it to the `[share]` bucket (or `--to` for an ad-hoc destination), then prints the public URL. No redaction is applied - anything in the transcript, including secrets, becomes public. Requires `--yes` or an interactive confirm.
+Renders the session as a self-contained HTML page and writes it to the `[share]` bucket (or `--to` for an ad-hoc destination), then prints a presigned URL (valid 48h by default; see `--expires-hours`) unless `[share].public_base_url` is configured for a permanent link. No redaction is applied - anyone with the link can see the full transcript, including secrets. Requires `--yes` or an interactive confirm.
 
 Usage: pond share [OPTIONS] <SESSION_ID>
 
@@ -20,6 +20,9 @@ Options:
           Overrides `[share].viewer` for this run
           
           [possible values: html]
+
+      --expires-hours <HOURS>
+          Overrides `[share].presign_expiry_hours` for this run. Ignored when `[share].public_base_url` applies (that link doesn't expire)
 
       --yes
           Skip the interactive confirm prompt
@@ -53,4 +56,5 @@ Examples:
   pond share 01HXY...                            confirm interactively, publish to [share].bucket
   pond share 01HXY... --yes                      skip the confirm prompt
   pond share 01HXY... --to s3://bucket/shares    publish to an ad-hoc bucket
+  pond share 01HXY... --expires-hours 6          presigned link valid for 6h instead of the 48h default
   pond share 01HXY... --yes --open               publish and open the URL in a browser

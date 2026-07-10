@@ -760,17 +760,20 @@ enum Command {
         #[arg(long)]
         verify_only: bool,
     },
-    /// Publish one session's transcript to a public link.
+    /// Publish one session's transcript to a link.
     ///
     /// Renders the session as a self-contained HTML page and writes it to the
-    /// `[share]` bucket (or `--to` for an ad-hoc destination), then prints the
-    /// public URL. No redaction is applied - anything in the transcript,
-    /// including secrets, becomes public. Requires `--yes` or an interactive
+    /// `[share]` bucket (or `--to` for an ad-hoc destination), then prints a
+    /// presigned URL (valid 48h by default; see `--expires-hours`) unless
+    /// `[share].public_base_url` is configured for a permanent link. No
+    /// redaction is applied - anyone with the link can see the full
+    /// transcript, including secrets. Requires `--yes` or an interactive
     /// confirm.
     #[command(after_long_help = "Examples:
   pond share 01HXY...                            confirm interactively, publish to [share].bucket
   pond share 01HXY... --yes                      skip the confirm prompt
   pond share 01HXY... --to s3://bucket/shares    publish to an ad-hoc bucket
+  pond share 01HXY... --expires-hours 6          presigned link valid for 6h instead of the 48h default
   pond share 01HXY... --yes --open               publish and open the URL in a browser")]
     #[command(display_order = 18)]
     Share {
@@ -783,6 +786,10 @@ enum Command {
         /// Overrides `[share].viewer` for this run.
         #[arg(long, value_enum)]
         viewer: Option<CliShareViewer>,
+        /// Overrides `[share].presign_expiry_hours` for this run. Ignored
+        /// when `[share].public_base_url` applies (that link doesn't expire).
+        #[arg(long, value_name = "HOURS")]
+        expires_hours: Option<u64>,
         /// Skip the interactive confirm prompt.
         #[arg(long)]
         yes: bool,
@@ -1575,6 +1582,7 @@ async fn main() -> anyhow::Result<()> {
             session_id,
             to,
             viewer,
+            expires_hours,
             yes,
             open,
         } => {
@@ -1587,6 +1595,7 @@ async fn main() -> anyhow::Result<()> {
                     session_id,
                     to,
                     viewer: viewer.map(Into::into),
+                    expires_hours,
                     yes,
                     open,
                 },

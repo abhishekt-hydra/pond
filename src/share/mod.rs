@@ -48,6 +48,9 @@ pub struct ShareArgs {
     pub to: Option<String>,
     /// Overrides `[share].viewer` for this run.
     pub viewer: Option<ShareViewer>,
+    /// Overrides `[share].presign_expiry_hours` for this run. Ignored when
+    /// `[share].public_base_url` applies (that link doesn't expire).
+    pub expires_hours: Option<u64>,
     /// Skip the interactive confirm prompt.
     pub yes: bool,
     /// Open the published URL in the default browser after publishing.
@@ -79,11 +82,22 @@ fn renderer_for(loaded: &Config, viewer: ShareViewer) -> Box<dyn ShareRenderer> 
     }
 }
 
-/// Resolve the publish destination: `--to` (ad-hoc, falls back to the
-/// resolved storage URL as the printed "public" URL when no
-/// `[share].public_base_url` applies) or `[share].bucket` +
-/// `[share].public_base_url` from config.
-fn publisher_for(loaded: &Config, to: Option<&str>) -> Result<Box<dyn SharePublisher>> {
+/// `[share].presign_expiry_hours`, overridden by `--expires-hours` for this run.
+fn presign_expiry(loaded: &Config, expires_hours: Option<u64>) -> std::time::Duration {
+    match expires_hours {
+        Some(hours) => std::time::Duration::from_secs(hours * 3600),
+        None => loaded.share.presign_expiry(),
+    }
+}
+
+/// Resolve the publish destination: `--to` (ad-hoc, falls back to a
+/// presigned URL - `[share].public_base_url` never applies to an ad-hoc
+/// destination) or `[share].bucket` + `[share].public_base_url` from config.
+fn publisher_for(
+    loaded: &Config,
+    to: Option<&str>,
+    presign_expiry: std::time::Duration,
+) -> Result<Box<dyn SharePublisher>> {
     let bucket = match to {
         Some(url) => url,
         None => loaded.share.bucket.as_deref().ok_or_else(|| {
@@ -93,13 +107,19 @@ fn publisher_for(loaded: &Config, to: Option<&str>) -> Result<Box<dyn SharePubli
             )
         })?,
     };
-    let public_base_url = to.is_none().then(|| loaded.share.public_base_url.clone()).flatten();
+    let public_base_url = to
+        .is_none()
+        .then(|| loaded.share.public_base_url.clone())
+        .flatten();
     match loaded.share.provider.unwrap_or_default() {
-        crate::config::ShareProvider::Bucket => Ok(Box::new(publish::bucket::BucketPublisher::new(
-            bucket,
-            loaded.creds.clone(),
-            public_base_url,
-        )?)),
+        crate::config::ShareProvider::Bucket => {
+            Ok(Box::new(publish::bucket::BucketPublisher::new(
+                bucket,
+                loaded.creds.clone(),
+                public_base_url,
+                presign_expiry,
+            )?))
+        }
     }
 }
 
@@ -141,17 +161,17 @@ pub async fn run(store: &Store, loaded: &Config, args: ShareArgs) -> Result<()> 
     if !args.yes {
         if !std::io::stdin().is_terminal() {
             bail!(
-                "`pond share` publishes a full transcript to a public URL with no redaction; \
-                 stdin is not a terminal, so confirm with `pond share {} --yes`",
+                "`pond share` publishes a full transcript with no redaction; stdin is not a \
+                 terminal, so confirm with `pond share {} --yes`",
                 args.session_id
             );
         }
         crate::output::line(&crate::output::paint(
-            "This publishes the full transcript to a public URL. No redaction is applied - \
-             anything in the transcript, including secrets, becomes public.",
+            "This publishes the full transcript to a link. No redaction is applied - anyone \
+             who gets the link can see anything in the transcript, including secrets.",
             crate::output::yellow(),
         ))?;
-        let confirmed = cliclack::confirm("Publish this transcript to a public URL?")
+        let confirmed = cliclack::confirm("Publish this transcript to a link?")
             .initial_value(false)
             .interact()
             .context("share confirmation prompt failed; nothing published")?;
@@ -161,7 +181,8 @@ pub async fn run(store: &Store, loaded: &Config, args: ShareArgs) -> Result<()> 
         }
     }
 
-    let publisher = publisher_for(loaded, args.to.as_deref())?;
+    let expiry = presign_expiry(loaded, args.expires_hours);
+    let publisher = publisher_for(loaded, args.to.as_deref(), expiry)?;
     let id = generate_id();
     let url = publisher.publish(&id, &artifact).await?;
     crate::output::line(&format!(
@@ -169,6 +190,18 @@ pub async fn run(store: &Store, loaded: &Config, args: ShareArgs) -> Result<()> 
         crate::output::paint("share:", crate::output::dim()),
         url,
     ))?;
+    // A presigned URL always carries SigV4/SAS query params; the
+    // public_base_url and local-fallback paths never do. Sniffing the
+    // returned URL (rather than re-deriving `publisher_for`'s public_base_url
+    // logic here) stays correct even for schemes `BucketPublisher` can't sign
+    // (`file://`/`memory://`), which fall back to a bare, non-expiring URL.
+    if url.contains('?') {
+        let hours = expiry.as_secs() / 3600;
+        crate::output::line(&crate::output::paint(
+            &format!("share: link expires in {hours}h"),
+            crate::output::dim(),
+        ))?;
+    }
 
     if args.open {
         open_in_browser(&url)?;

@@ -1,13 +1,26 @@
 //! [`BucketPublisher`]: writes a [`ShareArtifact`](super::super::ShareArtifact)
-//! to a public bucket via `object_store`, mirroring the config -> bucket
-//! client construction already used by `substrate::export_write` /
-//! `substrate::storage_check`.
+//! to a bucket via `object_store`, mirroring the config -> bucket client
+//! construction already used by `substrate::export_write` /
+//! `substrate::storage_check`. The bucket is not assumed public: unless
+//! `public_base_url` is configured, the printed URL is a presigned GET link
+//! (see [`presigned_url`]), not the bucket's raw address.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
-use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor};
-use object_store::{Attribute, ObjectStoreExt, PutMode, PutOptions, PutPayload};
+use http::Method;
+use lance_io::object_store::{
+    ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor,
+};
+use object_store::{
+    Attribute, ObjectStoreExt, PutMode, PutOptions, PutPayload,
+    aws::{AmazonS3Builder, AmazonS3ConfigKey},
+    azure::{AzureConfigKey, MicrosoftAzureBuilder},
+    gcp::{GoogleCloudStorageBuilder, GoogleConfigKey},
+    path::Path as ObjectPath,
+    signer::Signer,
+};
+use url::Url;
 
 use crate::{
     config::CredsSet,
@@ -18,11 +31,13 @@ use crate::{
 pub struct BucketPublisher {
     bucket_url: StorageUrl,
     creds: BTreeMap<String, CredsSet>,
-    /// Public origin serving `bucket_url`'s contents. `None` falls back to
-    /// printing the resolved storage URL of the written object - not
-    /// necessarily browser-clickable for a remote bucket, but exactly right
-    /// for a local `file://` target (the `--to` smoke-test path).
+    /// Public origin serving `bucket_url`'s contents, for a genuinely public
+    /// bucket / CDN. `None` (the default) means the bucket is private: the
+    /// published URL is presigned instead (see `presign_expiry`).
     public_base_url: Option<String>,
+    /// Lifetime of the presigned URL returned when `public_base_url` is
+    /// unset. Ignored otherwise.
+    presign_expiry: Duration,
 }
 
 impl BucketPublisher {
@@ -30,13 +45,15 @@ impl BucketPublisher {
         bucket: &str,
         creds: BTreeMap<String, CredsSet>,
         public_base_url: Option<String>,
+        presign_expiry: Duration,
     ) -> Result<Self> {
-        let bucket_url =
-            StorageUrl::parse(bucket).with_context(|| format!("invalid share bucket URL {bucket:?}"))?;
+        let bucket_url = StorageUrl::parse(bucket)
+            .with_context(|| format!("invalid share bucket URL {bucket:?}"))?;
         Ok(Self {
             bucket_url,
             creds,
             public_base_url,
+            presign_expiry,
         })
     }
 }
@@ -100,9 +117,91 @@ impl SharePublisher for BucketPublisher {
             }
         }
 
-        Ok(match &self.public_base_url {
-            Some(base) => format!("{}/{}.{}", base.trim_end_matches('/'), id, artifact.ext),
-            None => object_uri,
-        })
+        if let Some(base) = &self.public_base_url {
+            return Ok(format!(
+                "{}/{}.{}",
+                base.trim_end_matches('/'),
+                id,
+                artifact.ext
+            ));
+        }
+        presigned_url(
+            resolved.lance_url(),
+            &resolved.options,
+            &path,
+            self.presign_expiry,
+            &object_uri,
+        )
+        .await
+        .with_context(|| format!("failed to presign share URL for {object_uri}"))
+    }
+}
+
+/// Sign a time-limited GET URL for `path` inside the bucket `lance_url`
+/// (`options` are the same creds-resolved `object_store` config the write
+/// above used) so a private bucket never needs to be made public just to
+/// share one object. Schemes without a `Signer` impl, namely `file://` and
+/// `memory://` (the local smoke-test targets), fall back to `object_uri`
+/// verbatim, the same value pond printed before presigning existed. It can't
+/// be reconstructed from `lance_url` + `path`: `path` is already relative to
+/// the *bucket root* and so re-includes any prefix `lance_url` itself
+/// carries (e.g. `[share].bucket = ".../my-bucket/shares"` widens to `path =
+/// "shares/share_xyz.html"`), which would double it up.
+async fn presigned_url(
+    lance_url: &Url,
+    options: &std::collections::HashMap<String, String>,
+    path: &ObjectPath,
+    expiry: Duration,
+    object_uri: &str,
+) -> Result<String> {
+    match lance_url.scheme() {
+        "s3" => {
+            let mut builder = AmazonS3Builder::new().with_url(lance_url.as_str());
+            for (key, value) in options {
+                if let Ok(key) = key.parse::<AmazonS3ConfigKey>() {
+                    builder = builder.with_config(key, value.clone());
+                }
+            }
+            let store = builder
+                .build()
+                .context("failed to build S3 client for presigning")?;
+            Ok(store
+                .signed_url(Method::GET, path, expiry)
+                .await?
+                .to_string())
+        }
+        "gs" => {
+            let mut builder = GoogleCloudStorageBuilder::new().with_url(lance_url.as_str());
+            for (key, value) in options {
+                if let Ok(key) = key.parse::<GoogleConfigKey>() {
+                    builder = builder.with_config(key, value.clone());
+                }
+            }
+            let store = builder
+                .build()
+                .context("failed to build GCS client for presigning")?;
+            Ok(store
+                .signed_url(Method::GET, path, expiry)
+                .await?
+                .to_string())
+        }
+        "az" => {
+            let mut builder = MicrosoftAzureBuilder::new().with_url(lance_url.as_str());
+            for (key, value) in options {
+                if let Ok(key) = key.parse::<AzureConfigKey>() {
+                    builder = builder.with_config(key, value.clone());
+                }
+            }
+            let store = builder
+                .build()
+                .context("failed to build Azure client for presigning")?;
+            Ok(store
+                .signed_url(Method::GET, path, expiry)
+                .await?
+                .to_string())
+        }
+        // `file://` / `memory://`: no `Signer` impl, and nothing to protect -
+        // these only ever come from a local `--to` smoke-test target.
+        _ => Ok(object_uri.to_owned()),
     }
 }

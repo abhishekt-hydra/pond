@@ -141,6 +141,40 @@ explicitly — worth flagging in review since it's new, easy to silently get wro
 manifests as a broken user-facing behavior (not a compile or test failure, if a test only checks
 byte-for-byte content and not headers).
 
+## The published URL: presigned by default, not a public bucket
+
+The original design (see the "Why a static export" section above) assumed a public bucket - R2 +
+custom domain, or any bucket with public-read on the written prefix. `BucketPublisher` still
+supports that (`[share].public_base_url`), but it's no longer the default: with
+`public_base_url` unset, `publish()` signs a time-limited GET URL via `object_store`'s
+[`Signer`](https://docs.rs/object_store/latest/object_store/signer/trait.Signer.html) trait
+(`AmazonS3`/`GoogleCloudStorage`/`MicrosoftAzure` all implement it) instead of returning the
+bucket's raw address. Default lifetime is 48h (`[share].presign_expiry_hours`, or `--expires-hours`
+per invocation) - long enough to forward a link without it going stale mid-conversation, short
+enough that a leaked link doesn't stay live indefinitely.
+
+This flips the security model: `bucket` is now assumed *private*, and `pond share` only ever grants
+scoped, expiring read access to the one object it just wrote - not blanket public-read on the whole
+prefix. `public_base_url` remains for anyone who genuinely wants a permanent, non-expiring link
+(their own CDN/custom domain in front of a bucket they've made public on purpose).
+
+One constraint worth flagging for anyone extending this: `Signer::signed_url` needs a *concrete*
+backend client (`AmazonS3`, not `Arc<dyn ObjectStore>`), so `presigned_url` in
+`share/publish/bucket.rs` builds a second, throwaway client from the same `resolved.options`
+`BucketPublisher::publish` already used to write the bytes - `lance_io::object_store::ObjectStore`
+type-erases its inner client and exposes no downcast, so there's no way to reuse the one already
+open. The two clients share the same config (same creds resolution, same endpoint), so this is a
+cheap, symmetric rebuild, not a real duplication of logic. One thing it deliberately doesn't
+replicate: lance-io's own AWS provider (`providers/aws.rs`) falls back to the AWS SDK's ambient
+env/IMDS credential chain when no `[creds.*]` scope matches, so a write can succeed with no
+explicit creds configured at all. `presigned_url` only ever builds its client from
+`resolved.options` (the already-materialized `[creds.*]` set) - it does not invoke that ambient
+chain. A share bucket relying on it for writes will therefore fail at the presign step (missing
+access key) even though the write itself worked; give the share bucket its own `[creds.share]` set
+with an explicit access key + secret instead. (SigV4 presigning does work fine with temporary STS
+credentials in principle - `AmazonS3Builder` just needs them handed in explicitly, same as static
+ones - so this is a scope decision, not a hard protocol limitation.)
+
 ## ID generation: follow the one convention that already exists
 
 No `ulid`/`nanoid`/slug generator exists anywhere in pond. The established pattern for a fresh

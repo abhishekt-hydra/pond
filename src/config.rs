@@ -312,9 +312,16 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # [share]
 # provider        = \"bucket\"
 # bucket          = \"s3+https://acct.r2.cloudflarestorage.com/pond-shares\"
-# public_base_url = \"https://shares.example.com\"
 # viewer          = \"html\"
 # max_inline_image_bytes = \"2 MiB\"
+#
+# Leave public_base_url unset (the default): `pond share` treats `bucket` as
+# private and prints a presigned GET URL instead, valid for
+# presign_expiry_hours (default 48). Only set public_base_url if `bucket` is
+# genuinely public (or fronted by a CDN/custom domain) and you want a
+# permanent, non-expiring link instead.
+# public_base_url    = \"https://shares.example.com\"
+# presign_expiry_hours = 48
 #
 # [creds.share]
 # scope             = \"s3+https://acct.r2.cloudflarestorage.com/pond-shares\"
@@ -430,13 +437,22 @@ pub struct ShareConfig {
     /// an unimplemented value fails at config-load with serde's own
     /// "unknown variant" error instead of a runtime `bail!`.
     pub provider: Option<ShareProvider>,
-    /// Public bucket URL (same grammar as `[storage].path`), resolved against
-    /// `[creds.<name>]` exactly like any other storage address.
+    /// Bucket URL (same grammar as `[storage].path`), resolved against
+    /// `[creds.<name>]` exactly like any other storage address. Not assumed
+    /// public - see `public_base_url` and `presign_expiry_hours`.
     pub bucket: Option<String>,
     /// Public origin that serves `bucket`'s contents, e.g.
     /// `https://shares.example.com`. Combined with the generated share id to
-    /// form the printed URL: `{public_base_url}/{id}.{ext}`.
+    /// form the printed URL: `{public_base_url}/{id}.{ext}`. Set this only if
+    /// `bucket` is genuinely public (or fronted by a CDN/custom domain) and a
+    /// permanent link is wanted. `None` (the default) means `bucket` is
+    /// treated as private: `pond share` instead prints a presigned GET URL
+    /// valid for `presign_expiry_hours`.
     pub public_base_url: Option<String>,
+    /// How long a presigned URL stays valid when `public_base_url` is unset.
+    /// `None` = [`DEFAULT_SHARE_PRESIGN_EXPIRY_HOURS`] (48h). Ignored when
+    /// `public_base_url` is set (that link doesn't expire).
+    pub presign_expiry_hours: Option<u64>,
     /// Artifact format. Only `html` is implemented in v1.
     #[serde(default)]
     pub viewer: ShareViewer,
@@ -446,6 +462,24 @@ pub struct ShareConfig {
     /// (`"2 MiB"` or a bare integer). `None` = a 2 MiB built-in default.
     #[serde(default, deserialize_with = "deserialize_byte_size_opt")]
     pub max_inline_image_bytes: Option<usize>,
+}
+
+/// Default presigned-URL lifetime for `[share]` publishes that don't set
+/// `public_base_url` - long enough to forward a link over Slack/email without
+/// it going stale mid-conversation, short enough that a leaked link doesn't
+/// stay live indefinitely.
+pub const DEFAULT_SHARE_PRESIGN_EXPIRY_HOURS: u64 = 48;
+
+impl ShareConfig {
+    /// Resolve `presign_expiry_hours` to a [`Duration`], applying the
+    /// [`DEFAULT_SHARE_PRESIGN_EXPIRY_HOURS`] default when unset.
+    pub fn presign_expiry(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.presign_expiry_hours
+                .unwrap_or(DEFAULT_SHARE_PRESIGN_EXPIRY_HOURS)
+                * 3600,
+        )
+    }
 }
 
 /// `[share].provider` values. Single-variant today; `GitHubPagesPublisher` /

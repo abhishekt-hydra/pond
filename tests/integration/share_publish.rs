@@ -2,17 +2,20 @@
 //! `s3_backend.rs`'s fixture pattern: publish an artifact, read it back
 //! straight off the filesystem the fixture serves from, and confirm both the
 //! bytes and the `Content-Type` header the browser needs to render (not
-//! download) the shared page.
+//! download) the shared page. The second test also round-trips a presigned
+//! URL through the fixture's own SigV4 verification to prove signing (not
+//! just writing) actually works end to end.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use object_store::ObjectStoreExt;
 use pond::{
-    config::CredsSet,
+    config::{CredsSet, DEFAULT_SHARE_PRESIGN_EXPIRY_HOURS},
     share::{ShareArtifact, SharePublisher, publish::bucket::BucketPublisher},
 };
 use s3s::auth::SimpleAuth;
@@ -20,6 +23,10 @@ use s3s::service::S3ServiceBuilder;
 use s3s_fs::FileSystem;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
+
+fn default_presign_expiry() -> Duration {
+    Duration::from_secs(DEFAULT_SHARE_PRESIGN_EXPIRY_HOURS * 3600)
+}
 
 const ACCESS_KEY: &str = "test-access-key";
 const SECRET_KEY: &str = "test-secret-key";
@@ -63,7 +70,8 @@ async fn spawn_s3s_fs(bucket: &str) -> anyhow::Result<S3sFixture> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn bucket_publisher_writes_bytes_and_content_type_and_returns_public_url() -> anyhow::Result<()> {
+async fn bucket_publisher_writes_bytes_and_content_type_and_returns_public_url()
+-> anyhow::Result<()> {
     let fx = spawn_s3s_fs("pond-shares").await?;
     let endpoint_host = fx.endpoint.trim_start_matches("http://");
     let bucket_url = format!("s3+http://{endpoint_host}/pond-shares/");
@@ -83,6 +91,7 @@ async fn bucket_publisher_writes_bytes_and_content_type_and_returns_public_url()
         &bucket_url,
         creds.clone(),
         Some("https://shares.example.com".to_owned()),
+        default_presign_expiry(),
     )?;
     let artifact = ShareArtifact {
         bytes: b"<!DOCTYPE html><html><body>hi</body></html>".to_vec(),
@@ -96,7 +105,11 @@ async fn bucket_publisher_writes_bytes_and_content_type_and_returns_public_url()
     // maps s3://<bucket>/<key> to <root>/<bucket>/<key>) to confirm the PUT
     // actually landed with the right bytes, independent of pond's own read
     // path.
-    let object_path = fx._root.path().join("pond-shares").join("share_test123.html");
+    let object_path = fx
+        ._root
+        .path()
+        .join("pond-shares")
+        .join("share_test123.html");
     let written = std::fs::read(&object_path).expect("published object must exist on disk");
     assert_eq!(written, artifact.bytes);
 
@@ -113,9 +126,11 @@ async fn bucket_publisher_writes_bytes_and_content_type_and_returns_public_url()
     let resolved = get_url.resolve(&creds)?;
     let params = lance_io::object_store::ObjectStoreParams {
         storage_options_accessor: (!resolved.options.is_empty()).then(|| {
-            std::sync::Arc::new(lance_io::object_store::StorageOptionsAccessor::with_static_options(
-                resolved.options.clone(),
-            ))
+            std::sync::Arc::new(
+                lance_io::object_store::StorageOptionsAccessor::with_static_options(
+                    resolved.options.clone(),
+                ),
+            )
         }),
         ..Default::default()
     };
@@ -129,7 +144,9 @@ async fn bucket_publisher_writes_bytes_and_content_type_and_returns_public_url()
     let got = store.inner.get(&path).await?;
     assert_eq!(
         got.attributes.get(&object_store::Attribute::ContentType),
-        Some(&object_store::AttributeValue::from("text/html; charset=utf-8".to_owned())),
+        Some(&object_store::AttributeValue::from(
+            "text/html; charset=utf-8".to_owned()
+        )),
         "GET must return the Content-Type set on PUT, or a browser downloads the page instead of rendering it",
     );
 
@@ -137,7 +154,7 @@ async fn bucket_publisher_writes_bytes_and_content_type_and_returns_public_url()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn bucket_publisher_falls_back_to_storage_url_with_no_public_base_url() -> anyhow::Result<()> {
+async fn bucket_publisher_presigns_a_working_url_with_no_public_base_url() -> anyhow::Result<()> {
     let fx = spawn_s3s_fs("pond-shares").await?;
     let endpoint_host = fx.endpoint.trim_start_matches("http://");
     let bucket_url = format!("s3+http://{endpoint_host}/pond-shares/");
@@ -153,21 +170,43 @@ async fn bucket_publisher_falls_back_to_storage_url_with_no_public_base_url() ->
         },
     );
 
-    let publisher = BucketPublisher::new(&bucket_url, creds, None)?;
+    // A short expiry, not the default 48h: only its presence in the signed
+    // URL matters here, and a short window keeps the test's intent obvious.
+    let publisher = BucketPublisher::new(&bucket_url, creds, None, Duration::from_secs(300))?;
     let artifact = ShareArtifact {
         bytes: b"hi".to_vec(),
         content_type: "text/html; charset=utf-8".to_owned(),
         ext: "html".to_owned(),
     };
     let url = publisher.publish("share_test456", &artifact).await?;
-    // No public_base_url configured: falls back to the resolved storage URL
-    // of the written object - not a public link for a remote bucket, but
-    // directly usable for a local file:// smoke-test target.
+
+    // No public_base_url configured: the bucket is private, so the printed
+    // URL must be presigned (SigV4 query params), not the bucket's own
+    // address - a bare URL would 403 against a real private bucket.
     assert!(
-        url.ends_with("/share_test456.html"),
-        "expected a storage-URL fallback, got: {url}",
+        url.contains("X-Amz-Signature="),
+        "expected a presigned URL, got: {url}",
     );
     assert!(!url.starts_with("https://shares.example.com"));
+
+    // Prove the signature is actually valid, not just present: fetch it
+    // through the fixture's own SigV4 verification path (the same one a
+    // browser opening the shared link would hit) and confirm both the bytes
+    // and the Content-Type survive.
+    let response = reqwest::get(&url).await?;
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "presigned URL must authenticate"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .map(|v| v.as_bytes()),
+        Some(artifact.content_type.as_bytes()),
+    );
+    assert_eq!(response.bytes().await?.as_ref(), artifact.bytes.as_slice());
 
     Ok(())
 }

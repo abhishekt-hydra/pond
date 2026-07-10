@@ -108,6 +108,11 @@ fastrand = "2"
 # the two providers pond composes.
 figment = { version = "0.10.19", features = ["toml", "env"] }
 hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
+# Already in the tree at 1.4.2 via object_store/axum; named directly so
+# `share::publish::bucket` can pass `http::Method::GET` to `object_store`'s
+# `Signer::signed_url` (presigned share URLs) without pulling in all of
+# `reqwest` (whose re-exported `Method` is this exact type) just for one enum.
+http = { version = "1", default-features = false }
 indicatif = "0.18"
 lance = { version = "8.0.0", features = ["protoc"] }
 lance-arrow = "8.0.0"
@@ -207,6 +212,11 @@ lance-index = "8.0.0"
 # Re-declared so the MCP integration test can drive the server in-process via the `client` feature.
 rmcp = { version = "1.7", features = ["client"] }
 insta = "1.47.2"
+# Dev-only: `tests/integration/share_publish.rs` fetches a presigned share URL
+# to prove it actually authenticates, not just that it looks well-formed.
+# `default-features = false` drops the TLS backends - the fixture is plain
+# `http://`, and pond itself never links reqwest (only object_store does).
+reqwest = { version = "0.12", default-features = false }
 tempfile = "3.25"
 # Lets the HTTP integration test drive axum's `Router` without binding a socket.
 tower = { version = "0.5", features = ["util"] }
