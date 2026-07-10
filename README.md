@@ -134,7 +134,7 @@ pond share <session-id> --expires-hours 6           # shorter presigned link tha
 
 Needs a `[share]` bucket configured (see `pond config schema`) or an ad-hoc `--to <url>`; publishing credentials resolve the same way as any other storage address, so a separate `[creds.share]` set keeps them apart from your data-store credentials. The bucket doesn't need to be public: by default `pond share` prints a presigned URL valid for 48h (`[share].presign_expiry_hours` / `--expires-hours`), so anyone with the link can view it without the bucket itself granting public read. Set `[share].public_base_url` instead if you'd rather front a genuinely public bucket with a permanent, non-expiring link.
 
-From inside Claude Code mid-session: install `integrations/claude-code/commands/pshare.md` as `/pshare` and publish without leaving the conversation. Full guide: [`docs/claude-code-share.md`](docs/claude-code-share.md).
+From inside Claude Code or Codex mid-session: run `scripts/install-pshare-command.sh` to add a `/pshare` command that publishes the session you're in without leaving the conversation. Full guide: [`docs/share-command.md`](docs/share-command.md).
 
 ### Read-only SQL
 
