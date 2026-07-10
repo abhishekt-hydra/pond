@@ -166,24 +166,26 @@ header h1 { font-size: 1.1rem; margin: 0 0 0.25rem; }
   font-family: var(--font-mono); font-size: 0.82rem;
 }
 .tool-block.failed { background: var(--tool-fail-bg); }
-.tool-block > summary, .system-block > summary {
+.tool-block > summary, .message.system > summary {
   cursor: pointer; user-select: none; list-style: none; font-weight: 600;
   padding: 0.6rem 0.8rem; display: flex; align-items: center; gap: 0.45rem;
 }
-.tool-block > summary::-webkit-details-marker, .system-block > summary::-webkit-details-marker { display: none; }
-.tool-block > summary::before, .system-block > summary::before {
+.tool-block > summary::-webkit-details-marker, .message.system > summary::-webkit-details-marker { display: none; }
+.tool-block > summary::before, .message.system > summary::before {
   content: "\25b8"; font-size: 0.65rem; color: var(--text-muted); flex: none;
 }
-.tool-block[open] > summary::before, .system-block[open] > summary::before { content: "\25be"; }
+.tool-block[open] > summary::before, .message.system[open] > summary::before { content: "\25be"; }
 .tool-block-body { white-space: pre-wrap; word-wrap: break-word; padding: 0 0.8rem 0.7rem; }
-.system-block {
-  background: var(--bg-inset); border-radius: var(--radius); margin: 0.4rem 0; font-size: 0.85rem;
+.message.system { padding: 0; background: var(--bg-inset); }
+.message.system > summary {
+  padding: 0.9rem 1.1rem; margin: 0;
 }
-.system-block > summary {
-  font-weight: 400; color: var(--text-muted); font-size: 0.72rem;
-  text-transform: uppercase; letter-spacing: 0.04em;
+.system-messages { padding: 0 1.1rem 0.9rem; }
+.system-entry { padding-top: 0.75rem; }
+.system-entry + .system-entry { border-top: 1px solid var(--border); margin-top: 0.75rem; }
+.system-entry-header {
+  color: var(--text-muted); font-family: var(--font-mono); font-size: 0.72rem; margin-bottom: 0.4rem;
 }
-.system-block .text-block { padding: 0 0.8rem 0.7rem; }
 .file-block, .approval-block {
   background: var(--bg-inset); border-radius: var(--radius); padding: 0.5rem 0.8rem;
   margin: 0.4rem 0; font-size: 0.82rem; color: var(--text-secondary);
@@ -213,8 +215,15 @@ fn render_page(session: &SessionWithMessages, max_inline_image_bytes: usize) -> 
         fmt_ts(&session.session.created_at),
     );
     out.push_str("<main>\n");
-    for message in &session.messages {
-        render_message(&mut out, message, max_inline_image_bytes);
+    for messages in session.messages.chunk_by(|previous, current| {
+        message_role(&previous.message) == Role::System
+            && message_role(&current.message) == Role::System
+    }) {
+        if message_role(&messages[0].message) == Role::System {
+            render_system_messages(&mut out, messages, max_inline_image_bytes);
+        } else {
+            render_message(&mut out, &messages[0], max_inline_image_bytes);
+        }
     }
     out.push_str("</main>\n");
     out.push_str(
@@ -238,6 +247,9 @@ fn message_role(message: &Message) -> Role {
 
 fn render_message(out: &mut String, message: &MessageWithParts, max_inline_image_bytes: usize) {
     let role = message_role(&message.message);
+    if role == Role::Assistant && !message.parts.iter().any(|part| part_is_visible(&part.kind)) {
+        return;
+    }
     let _ = writeln!(
         out,
         "<div class=\"message {}\">\n<div class=\"message-header\">\
@@ -247,20 +259,61 @@ fn render_message(out: &mut String, message: &MessageWithParts, max_inline_image
         fmt_ts(&message.message.timestamp()),
         escape_html(message.message.id()),
     );
-    if let Some(content) = message.message.system_content()
-        && !content.trim().is_empty()
-    {
-        let _ = writeln!(
-            out,
-            "<details class=\"system-block\"><summary>System prompt</summary>\
-             <div class=\"text-block\">{}</div></details>",
-            escape_html(content),
-        );
-    }
     for part in &message.parts {
         render_part(out, &part.kind, max_inline_image_bytes);
     }
     out.push_str("</div>\n");
+}
+
+fn render_system_messages(
+    out: &mut String,
+    messages: &[MessageWithParts],
+    max_inline_image_bytes: usize,
+) {
+    let first = &messages[0].message;
+    let count = plural(messages.len(), "message");
+    let _ = writeln!(
+        out,
+        "<details class=\"message system\">\n<summary class=\"message-header\">\
+         <span class=\"message-role\">system</span><span>{count}</span><span>{}</span></summary>\
+         <div class=\"system-messages\">",
+        fmt_ts(&first.timestamp()),
+    );
+    for message in messages {
+        let _ = writeln!(
+            out,
+            "<div class=\"system-entry\"><div class=\"system-entry-header\">{} &middot; {}</div>",
+            fmt_ts(&message.message.timestamp()),
+            escape_html(message.message.id()),
+        );
+        if let Some(content) = message.message.system_content()
+            && !content.trim().is_empty()
+        {
+            let _ = writeln!(
+                out,
+                "<div class=\"text-block\">{}</div>",
+                escape_html(content)
+            );
+        }
+        for part in &message.parts {
+            render_part(out, &part.kind, max_inline_image_bytes);
+        }
+        out.push_str("</div>\n");
+    }
+    out.push_str("</div>\n</details>\n");
+}
+
+fn part_is_visible(kind: &PartKind) -> bool {
+    match kind {
+        PartKind::Text { text } | PartKind::Reasoning { text } => {
+            extracted_str(text).is_some_and(|text| !text.trim().is_empty())
+        }
+        PartKind::File { .. }
+        | PartKind::ToolCall { .. }
+        | PartKind::ToolResult { .. }
+        | PartKind::ToolApprovalRequest { .. }
+        | PartKind::ToolApprovalResponse { .. } => true,
+    }
 }
 
 fn render_part(out: &mut String, kind: &PartKind, max_inline_image_bytes: usize) {
@@ -573,18 +626,34 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_renders_as_collapsed_details() {
-        let session_id = "s1";
+    fn consecutive_system_messages_render_as_one_collapsed_card() {
         let mut session = session_with_parts(vec![]);
-        session.messages[0].message = serde_json::from_value(serde_json::json!({
-            "role": "system", "id": "m0", "session_id": session_id,
-            "timestamp": ts(), "content": "You are a helpful assistant.",
-        }))
-        .unwrap();
+        let system_message = |id: &str, content: &str| MessageWithParts {
+            message: serde_json::from_value(serde_json::json!({
+                "role": "system", "id": id, "session_id": "s1",
+                "timestamp": ts(), "content": content,
+            }))
+            .unwrap(),
+            parts: vec![],
+        };
+        let assistant = session.messages.pop().unwrap();
+        session.messages = vec![
+            system_message("m0", "First system record."),
+            system_message("m1", "Second system record."),
+            assistant,
+            system_message("m3", "Later system record."),
+        ];
         let renderer = HtmlRenderer::new();
         let html = String::from_utf8(renderer.render(&session).unwrap().bytes).unwrap();
-        assert!(html.contains("<details class=\"system-block\"><summary>System prompt</summary>"));
-        assert!(html.contains("You are a helpful assistant."));
+        assert_eq!(
+            html.matches("<details class=\"message system\">").count(),
+            2
+        );
+        assert!(html.contains("<span class=\"message-role\">system</span><span>2 messages</span>"));
+        assert!(html.contains("First system record."));
+        assert!(html.contains("Second system record."));
+        assert!(html.contains("Later system record."));
+        assert!(!html.contains("<details class=\"message system\" open>"));
     }
 
     #[test]
@@ -595,8 +664,21 @@ mod tests {
         let renderer = HtmlRenderer::new();
         let html =
             String::from_utf8(renderer.render(&session_with_parts(parts)).unwrap().bytes).unwrap();
+        assert!(html.contains("<div class=\"message assistant\">"));
         assert!(html.contains("thinking-block"));
         assert!(html.contains("thinking it through"));
+    }
+
+    #[test]
+    fn assistant_without_visible_parts_does_not_render_a_card() {
+        let parts = vec![
+            part(serde_json::json!({"type": "text", "text": "  \n"})),
+            part(serde_json::json!({"type": "reasoning"})),
+        ];
+        let renderer = HtmlRenderer::new();
+        let html =
+            String::from_utf8(renderer.render(&session_with_parts(parts)).unwrap().bytes).unwrap();
+        assert!(!html.contains("<div class=\"message assistant\">"));
     }
 
     #[test]
