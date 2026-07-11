@@ -191,6 +191,8 @@ pond storage check                                                # verify: pars
 
 `pond init --storage-path <url>` configures a remote destination during setup and prompts for credentials inline when the destination is remote, so a bucket is one command. The `s3+https://host/bucket` form works for any S3-compatible store (Hetzner, R2, B2, MinIO); `s3://`, `gs://`, and `az://` use the standard cloud SDK credential chain when no `[creds.*]` set matches. `pond copy --from <local> --to <url>` carries existing local data into the bucket - idempotent, never deletes the source, and on completion it rebuilds the destination indexes and verifies every row landed (exit 6 if any are missing or duplicated, so you never reconcile by hand). `pond copy --verify-only --from <local> --to <url>` runs that same check read-only, without copying. Full walkthrough: [pond.locker](https://pond.locker/).
 
+Setting up a second machine against a bucket you already use? `scripts/install-pond.sh` installs pond and copies [`config.template.toml`](config.template.toml) into place - no secrets in the file, credentials come from `POND_CREDS_DEFAULT_*` env vars. Full guide: [`docs/install-second-machine.md`](docs/install-second-machine.md).
+
 ### Configuration
 
 `pond init` walks through everything below interactively and enables the adapters it finds. `pond sync` only ingests already-enabled adapters - enabling one is an explicit step (`pond adapters enable` / `pond adapters discover` / `pond init`), never a side effect of sync. Config lives under `$XDG_CONFIG_HOME/pond/`. Every `[adapters.<name>]` block needs `enabled = true` to be active; sections without it (or with `enabled = false`) are skipped.
