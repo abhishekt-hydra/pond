@@ -19,8 +19,9 @@ use pond::{
     embed::{BatchProgress, CandleEmbedder, EmbedSummary, EmbedWorker, Embedder, LazyEmbedder},
     handlers::{self, IngestSummary, SessionOutcome, SyncEvent, SyncStatus},
     sessions::{
-        EmbeddingProgress, LanceArchiveCounts, LanceArchiveExport, LanceArchiveImport,
-        MESSAGES_FTS_INDEX, MESSAGES_VECTOR_INDEX, OptimizeOutcome, RowTotals, Store,
+        ClearEmbeddingsOutcome, EmbeddingProgress, LanceArchiveCounts, LanceArchiveExport,
+        LanceArchiveImport, MESSAGES_FTS_INDEX, MESSAGES_VECTOR_INDEX, OptimizeOutcome, RowTotals,
+        Store,
     },
     substrate::{
         self, CheckFailure, CredsBinding, IndexStatus, MaintenancePolicy, OptimizeEvent,
@@ -837,12 +838,16 @@ Homebrew and nix packages ship these pre-installed.")]
     /// folds trailing fragments into the text + semantic indexes and runs the
     /// `[maintenance]` compaction / version-cleanup pass. `pond sync` embeds
     /// inline and folds by default; this is the on-demand maintenance run and
-    /// the model-swap re-embed (`--force-embed`).
+    /// the model-swap re-embed (`--force-embed`). `--clear-embeddings` is the
+    /// reverse: null every vector, drop the semantic index, and shrink the
+    /// remote - a later `pond optimize` re-embeds from that null state exactly
+    /// like a no-embed `pond sync` backlog.
     #[command(after_long_help = "Examples:
   pond optimize                    embed any backlog, then fold indexes
   pond optimize --only index       fold indexes only
   pond optimize --only embed       embed only
-  pond optimize --force-embed      re-embed stale rows after a model change")]
+  pond optimize --force-embed      re-embed stale rows after a model change
+  pond optimize --clear-embeddings null every vector, drop the index, shrink the remote")]
     #[command(display_order = 8)]
     Optimize {
         /// Run exactly one stage: embed or index.
@@ -861,14 +866,24 @@ Homebrew and nix packages ship these pre-installed.")]
         /// `create_index(replace=true)`. Use this when normal optimize errors
         /// with "<N> delta segments; run `pond optimize --rebuild`". Skips
         /// embed and the incremental index-fold; runs only the rebuild.
-        #[arg(long, conflicts_with_all = ["only", "skip", "force_embed", "drop_index"])]
+        #[arg(long, conflicts_with_all = ["only", "skip", "force_embed", "drop_index", "clear_embeddings"])]
         rebuild: bool,
         /// One-shot orphan cleanup: drop a single named index from whichever
         /// table owns it. Used after renaming an intent (the old name is
         /// orphaned in the manifest until dropped). Tries every table in turn;
         /// errors when no table has an index by that name.
-        #[arg(long, value_name = "NAME", conflicts_with_all = ["only", "skip", "force_embed", "rebuild"])]
+        #[arg(long, value_name = "NAME", conflicts_with_all = ["only", "skip", "force_embed", "rebuild", "clear_embeddings"])]
         drop_index: Option<String>,
+        /// Null every message's `vector` and `embedding_model`, drop the
+        /// semantic (IVF_SQ) index, then compact and prune old versions so the
+        /// remote store physically shrinks - not just logically empties.
+        /// Search keeps working off FTS/keyword (vectors being null is the
+        /// same supported state a no-embed `pond sync` leaves behind).
+        /// Reversible: a later `pond optimize` (or `--only embed`) sees the
+        /// null rows as backlog and re-embeds them. Idempotent - a re-run with
+        /// nothing left to clear is a clean no-op.
+        #[arg(long, conflicts_with_all = ["only", "skip", "force_embed", "rebuild", "drop_index"])]
+        clear_embeddings: bool,
     },
 }
 
@@ -1318,6 +1333,7 @@ async fn main() -> anyhow::Result<()> {
             force_embed,
             rebuild,
             drop_index,
+            clear_embeddings,
         } => {
             let cmd_started = std::time::Instant::now();
             let loaded = Config::load(config_path(config))?;
@@ -1347,6 +1363,31 @@ async fn main() -> anyhow::Result<()> {
                     .await
                     .context("cleanup after rebuild failed")?;
                 output("optimize: indexes rebuilt, old segments reclaimed")?;
+            } else if clear_embeddings {
+                // Reverse of a normal optimize: null every vector, drop the
+                // semantic index, then compact + reclaim so the remote
+                // actually shrinks. Order (null, then drop, then fold) matters
+                // - see `Store::clear_embeddings` for why.
+                let policy = configured_maintenance_policy(&loaded, None)?;
+                let (progress, bar) = optimize_progress_bar();
+                let result = store.clear_embeddings(Some(progress), &policy).await;
+                bar.finish_and_clear();
+                let ClearEmbeddingsOutcome {
+                    rows_cleared,
+                    indices,
+                } = result.context("clear_embeddings failed")?;
+                if rows_cleared == 0 {
+                    output("optimize: no embeddings to clear (already null)")?;
+                } else {
+                    output(&format!(
+                        "optimize: cleared {} embedding(s), dropped vector index, \
+                         compacted + reclaimed old versions",
+                        format_thousands(rows_cleared),
+                    ))?;
+                }
+                if indices.any_indices_failed() {
+                    std::process::exit(1);
+                }
             } else {
                 let stages = OptimizeStages::resolve(only, &skip)?;
                 let policy = configured_maintenance_policy(&loaded, None)?;

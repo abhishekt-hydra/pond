@@ -279,6 +279,24 @@ impl OptimizeOutcome {
     }
 }
 
+/// What `Store::clear_embeddings` did: rows nulled, plus the compaction/fold
+/// outcome from the same finalize seam `pond optimize` uses - so the CLI can
+/// apply the same `any_indices_failed` check to this path as to a normal
+/// optimize run.
+#[derive(Debug, Default)]
+pub struct ClearEmbeddingsOutcome {
+    pub rows_cleared: u64,
+    pub indices: OptimizeOutcome,
+}
+
+impl ClearEmbeddingsOutcome {
+    /// True if any table's indices phase reported a non-conflict failure
+    /// during the compaction/fold pass that followed the clear.
+    pub fn any_indices_failed(&self) -> bool {
+        self.indices.any_indices_failed()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowTotals {
     pub sessions: u64,
@@ -3212,8 +3230,10 @@ impl Store {
     }
 
     /// Drop the IVF_SQ index on `messages.vector`. Used by `pond optimize
-    /// --force-embed` before re-bootstrapping under a different model. Silent
-    /// when the index does not exist.
+    /// --force-embed` before re-bootstrapping under a different model, and by
+    /// `pond optimize --clear-embeddings` (a store below
+    /// [`VECTOR_INDEX_ACTIVATION_ROWS`] never had one to begin with - the
+    /// common case there). Silent when the index does not exist.
     pub async fn drop_vector_index(&self) -> Result<()> {
         match self
             .handle
@@ -3222,7 +3242,13 @@ impl Store {
         {
             Ok(()) => Ok(()),
             Err(error) => {
-                let msg = error.to_string();
+                // `{error:#}` (anyhow's alternate Display) walks the whole
+                // `with_context` chain; `error.to_string()` prints only the
+                // outermost "drop_index(...) failed for messages" frame and
+                // never matches, so the "does not exist" cause from Lance
+                // (nested under `Handle::drop_index`'s context) would
+                // otherwise always propagate as a hard error.
+                let msg = format!("{error:#}");
                 if msg.contains("not found") || msg.contains("does not exist") {
                     Ok(())
                 } else {
@@ -3230,6 +3256,59 @@ impl Store {
                 }
             }
         }
+    }
+
+    /// Null `vector` and `embedding_model` on every message row, drop the
+    /// IVF_SQ vector index, then compact + reclaim old versions - the full
+    /// remote shrink behind `pond optimize --clear-embeddings`. Search still
+    /// works after this: null vectors are a supported state (the same one a
+    /// no-embed `pond sync` produces) and FTS/keyword retrieval doesn't touch
+    /// `vector` at all.
+    ///
+    /// Reversible: the nulled rows re-enter `pending_embedding_messages`'
+    /// backlog (it filters on `embedding_model IS NULL`, co-set with `vector`
+    /// by `write_embeddings`), so a later `pond optimize` (or `--only embed`)
+    /// re-embeds them under whatever model is configured then.
+    ///
+    /// Order matters: the index is dropped before the compaction pass so the
+    /// index's own segments - not just the nulled `vector` column's old
+    /// versions - are reclaimed by the same `cleanup_old_versions` sweep.
+    /// Once the vectors are null, the vector index's create-trigger
+    /// (`OnNonNullCount` against a now-zero non-null count) stays quiet, so
+    /// the fold that runs as part of compaction never tries to rebuild the
+    /// index that was just dropped.
+    pub async fn clear_embeddings(
+        &self,
+        progress: Option<OptimizeProgressFn>,
+        policy: &MaintenancePolicy,
+    ) -> Result<ClearEmbeddingsOutcome> {
+        let filter = Predicate::Or(vec![
+            Predicate::IsNotNull("vector"),
+            Predicate::IsNotNull("embedding_model"),
+        ])
+        .to_lance();
+        let rows_cleared = self
+            .handle
+            .null_columns(Table::Messages, &filter, &["vector", "embedding_model"])
+            .await
+            .context("clearing messages.vector/embedding_model failed")?;
+        self.drop_vector_index()
+            .await
+            .context("drop_vector_index failed")?;
+        let indices = self.optimize_indices(progress, policy).await?;
+        // Belt-and-suspenders: `optimize_indices`' compact phase already runs
+        // this when `policy.cleanup_interval <= 1` (true for every
+        // `pond optimize` invocation), but calling it again explicitly - as
+        // the `--rebuild` path already does after its own index rebuild -
+        // guarantees the just-nulled and just-dropped-index versions are
+        // reclaimed regardless of the configured interval.
+        self.cleanup_old_versions(policy.cleanup_older_than)
+            .await
+            .context("cleanup_old_versions after clear_embeddings failed")?;
+        Ok(ClearEmbeddingsOutcome {
+            rows_cleared,
+            indices,
+        })
     }
 
     /// On-disk byte totals per dataset, sized through Lance's object store
@@ -7606,6 +7685,70 @@ mod tests {
         let stream = store.pending_or_stale_messages();
         tokio::pin!(stream);
         assert!(stream.next().await.is_none(), "up-to-date rows are skipped");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clear_embeddings_nulls_vectors_drops_index_and_is_reversible() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (store, keys) = store_with_messages_at_threshold(&temp, 300, 256).await?;
+        store.write_embeddings(&embedded(&keys)).await?;
+        store
+            .optimize_indices_with_vector_threshold(256)
+            .await?
+            .into_result()?;
+        assert!(
+            store
+                .handle
+                .messages_index_names()
+                .await?
+                .iter()
+                .any(|name| name == MESSAGES_VECTOR_INDEX),
+            "IVF_SQ must exist before clear_embeddings",
+        );
+        assert_eq!(
+            store.embed_backlog_count().await?,
+            0,
+            "every row must be embedded before the clear",
+        );
+        let (_, messages_before, _) = store.row_counts().await?;
+        assert_eq!(messages_before, keys.len());
+
+        let policy = MaintenancePolicy::always_compact();
+        let outcome = store.clear_embeddings(None, &policy).await?;
+        assert_eq!(
+            outcome.rows_cleared,
+            keys.len() as u64,
+            "every embedded row must be nulled",
+        );
+        assert!(!outcome.any_indices_failed());
+        assert!(
+            !store
+                .handle
+                .messages_index_names()
+                .await?
+                .iter()
+                .any(|name| name == MESSAGES_VECTOR_INDEX),
+            "IVF_SQ must be dropped by clear_embeddings",
+        );
+        assert_eq!(
+            store.embed_backlog_count().await?,
+            keys.len(),
+            "nulled rows must re-enter the embed backlog (embedding_model IS NULL)",
+        );
+        let (_, messages_after, _) = store.row_counts().await?;
+        assert_eq!(
+            messages_after, messages_before,
+            "clear_embeddings must not change row count",
+        );
+
+        // Idempotent: nothing left to clear, no error, index drop swallowed.
+        let repeat = store.clear_embeddings(None, &policy).await?;
+        assert_eq!(repeat.rows_cleared, 0, "a repeat run must be a clean no-op");
+
+        // Reversible: a normal embed pass fills the null rows back in.
+        store.write_embeddings(&embedded(&keys)).await?;
+        assert_eq!(store.embed_backlog_count().await?, 0);
         Ok(())
     }
 
