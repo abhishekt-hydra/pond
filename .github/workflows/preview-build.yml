@@ -1,0 +1,83 @@
+name: Preview build
+
+# Manual, branch-targeted binary build. Runs the SAME all-platform cross-compile
+# as the release (moon pond:build-dist) but does NOT go through release-plz:
+# nothing lands on crates.io / Homebrew / nix (those track main). Instead it can
+# publish a GitHub *prerelease* whose assets are public download URLs anyone can
+# curl or install - use it to hand out installable binaries from a feature branch
+# without cutting a real release. The four archives + checksums also always land
+# as an Actions artifact (login-gated) as a fallback.
+#
+# GitHub only surfaces workflow_dispatch on the default branch, so this file must
+# live on main to be dispatchable - once there, pick any branch in the "Run
+# workflow" ref dropdown (or: gh workflow run preview-build.yml --ref <branch>)
+# and it builds THAT ref's code.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version label for the prerelease tag (published as v<version>). NOTE: the binary itself still self-reports its Cargo.toml version."
+        default: "0.13.1-beta"
+        required: true
+      publish_prerelease:
+        description: "Publish a public GitHub prerelease (vs. Actions-artifact-only)."
+        type: boolean
+        default: true
+
+permissions:
+  contents: write   # gh release create/upload for the prerelease
+
+env:
+  CARGO_TERM_COLOR: always
+  # Same warm rustc cache the release build rides; without it a cold 4-target
+  # dist build is ~56m. Secrets are present on same-repo dispatch.
+  KACHE_S3_ACCESS_KEY: ${{ secrets.KACHE_S3_ACCESS_KEY }}
+  KACHE_S3_SECRET_KEY: ${{ secrets.KACHE_S3_SECRET_KEY }}
+  KACHE_S3_REGION: nbg1
+  KACHE_S3_BUCKET: ttq
+  KACHE_S3_ENDPOINT: https://nbg1.your-objectstorage.com
+  KACHE_S3_PREFIX: kache/pond
+  KACHE_CACHE_DIR: /ci-cache/kache
+  KACHE_MAX_SIZE: 20GiB
+
+jobs:
+  build:
+    # Self-hosted ARC runner: the dist build needs zig/rcodesign/macOS SDK from
+    # the pond-runner image and the /ci-cache PVC. GitHub-hosted runners can't
+    # run this.
+    runs-on: pond-ci
+    timeout-minutes: 90
+    concurrency: { group: "preview-build-${{ github.ref }}", cancel-in-progress: true }
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with: { fetch-depth: 0 }
+      - uses: ./.github/actions/bootstrap
+      - name: Build + package binaries (macOS / Linux x64+arm64 / Windows)
+        run: moon run pond:build-dist
+
+      - name: Upload Actions artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pond-${{ github.ref_name }}-${{ github.sha }}
+          path: |
+            dist/pond-*
+            dist/checksums.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub prerelease
+        if: ${{ inputs.publish_prerelease }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          V: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # Idempotent: create the prerelease once (pinned to this exact commit),
+          # then (re)upload assets with --clobber so re-runs refresh them.
+          gh release view "v$V" >/dev/null 2>&1 || gh release create "v$V" \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "v$V" \
+            --notes "Preview build from \`$GITHUB_REF_NAME\` @ \`${GITHUB_SHA:0:7}\`. Prerelease: not on crates.io / Homebrew / nix."
+          gh release upload "v$V" dist/pond-* dist/checksums.txt --clobber
+          echo "Published: $(gh release view "v$V" --json url --jq .url)"

@@ -121,6 +121,21 @@ pond copy --from local --to snapshot.pond
 pond copy --from snapshot.pond --to local
 ```
 
+### Share a session
+
+Publish one session's full transcript as a self-contained HTML page to a link. No redaction is applied - it requires `--yes` or an interactive confirm that says so plainly:
+
+```sh
+pond share <session-id>                             # confirm interactively, publish to [share].bucket
+pond share <session-id> --yes --open                # skip the prompt, open the URL in a browser
+pond share <session-id> --to s3://bucket/shares     # publish to an ad-hoc destination
+pond share <session-id> --expires-hours 6           # shorter presigned link than the 48h default
+```
+
+Needs a `[share]` bucket configured (see `pond config schema`) or an ad-hoc `--to <url>`; publishing credentials resolve the same way as any other storage address, so a separate `[creds.share]` set keeps them apart from your data-store credentials. The bucket doesn't need to be public: by default `pond share` prints a presigned URL valid for 48h (`[share].presign_expiry_hours` / `--expires-hours`), so anyone with the link can view it without the bucket itself granting public read. Set `[share].public_base_url` instead if you'd rather front a genuinely public bucket with a permanent, non-expiring link.
+
+From inside Claude Code or Codex mid-session: run `scripts/install-pshare-command.sh` to add a `/pshare` command that publishes the session you're in without leaving the conversation. Full guide: [`docs/share-command.md`](docs/share-command.md).
+
 ### Read-only SQL
 
 Ask structured questions with read-only SQL (the same surface as the `pond_sql_query` MCP tool):
@@ -148,6 +163,18 @@ pond schedule status
 pond schedule logs
 ```
 
+### Live watch
+
+Back up sessions within seconds of being written, instead of waiting for the next scheduled tick (launchd on macOS, a systemd user service on Linux - no cron fallback, since this is a resident daemon, not an interval job):
+
+```sh
+pond watch start                   # incremental no-embed sync on every write
+pond watch status
+pond watch logs
+```
+
+Watch skips embedding for speed (full-text search sees new messages immediately; run `pond optimize` or let `pond schedule` catch up for semantic search). Full guide: [`docs/watch.md`](docs/watch.md).
+
 ### Status and introspection
 
 `pond status` prints a per-table storage table, then `indexes` (text/semantic readiness), `stored` (sessions + messages), `agents` (source agents in the store), and this host's view of it: per-adapter sessions pending sync, the last sync's outcome (including a surfaced failure from a scheduled run), and the next scheduled run. `pond status --hosts` breaks a shared store down by ingest host; `--include-subagents` counts each subagent as its own agent. `pond sync --dry-run` previews what the next sync would read. `pond search --explain` returns Lance's `analyze_plan` output for each retrieval arm.
@@ -163,6 +190,8 @@ pond storage check                                                # verify: pars
 ```
 
 `pond init --storage-path <url>` configures a remote destination during setup and prompts for credentials inline when the destination is remote, so a bucket is one command. The `s3+https://host/bucket` form works for any S3-compatible store (Hetzner, R2, B2, MinIO); `s3://`, `gs://`, and `az://` use the standard cloud SDK credential chain when no `[creds.*]` set matches. `pond copy --from <local> --to <url>` carries existing local data into the bucket - idempotent, never deletes the source, and on completion it rebuilds the destination indexes and verifies every row landed (exit 6 if any are missing or duplicated, so you never reconcile by hand). `pond copy --verify-only --from <local> --to <url>` runs that same check read-only, without copying. Full walkthrough: [pond.locker](https://pond.locker/).
+
+Setting up a second machine against a bucket you already use? `scripts/install-pond.sh` installs pond and copies [`config.template.toml`](config.template.toml) into place - no secrets in the file, credentials come from `POND_CREDS_DEFAULT_*` env vars. Full guide: [`docs/install-second-machine.md`](docs/install-second-machine.md).
 
 ### Configuration
 

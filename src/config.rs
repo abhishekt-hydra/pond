@@ -199,6 +199,18 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 #
 # Set `enabled = false` to keep the section but skip it on `pond sync`;
 # re-enable via `pond adapters enable <adapter>`.
+#
+# An adapter can pool more than one directory into one corpus with `paths`
+# instead of `path` - e.g. two Claude Code homes (a personal install and a
+# second CLAUDE_CONFIG_DIR):
+#
+# [adapters.claude-code]
+# enabled = true
+# paths = [\"~/.claude/projects\", \"~/work/.claude/projects\"]
+#
+# Set at most one of `path` / `paths` per adapter. A root nested inside
+# another configured root is dropped (it would double-scan); `pond watch`
+# places one filesystem watch per resolved root.
 
 # Embeddings. Search defaults to the vector arm (matching on meaning) when the
 # store has any vectors, falling back to FTS otherwise - the model loads lazily
@@ -291,6 +303,30 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # [creds.default]
 # access_key_id     = \"...\"
 # secret_access_key = \"...\"
+
+# `pond share <session-id>` publishing destination - a public bucket, distinct
+# from `[storage]`. Give it its own `[creds.share]` set scoped to `bucket` so
+# publishing credentials stay separate from the private data-store credentials.
+# No POND_* env mirror for this section (file-only, unlike [storage]/[creds]).
+#
+# [share]
+# provider        = \"bucket\"
+# bucket          = \"s3+https://acct.r2.cloudflarestorage.com/pond-shares\"
+# viewer          = \"html\"
+# max_inline_image_bytes = \"2 MiB\"
+#
+# Leave public_base_url unset (the default): `pond share` treats `bucket` as
+# private and prints a presigned GET URL instead, valid for
+# presign_expiry_hours (default 48). Only set public_base_url if `bucket` is
+# genuinely public (or fronted by a CDN/custom domain) and you want a
+# permanent, non-expiring link instead.
+# public_base_url    = \"https://shares.example.com\"
+# presign_expiry_hours = 48
+#
+# [creds.share]
+# scope             = \"s3+https://acct.r2.cloudflarestorage.com/pond-shares\"
+# access_key_id     = \"...\"
+# secret_access_key = \"...\"
 ";
 
 /// Top-level `config.toml` shape.
@@ -316,9 +352,15 @@ pub struct Config {
     /// `None` = the platform-local data dir.
     #[serde(default)]
     pub storage: StorageConfig,
+    /// `[share]`: `pond share`'s publishing destination. Distinct from
+    /// `[storage]` - shares go to a public bucket, not the private data store.
+    #[serde(default)]
+    pub share: ShareConfig,
     /// `[creds.<name>]`: URL-scoped credential sets. Every storage URL
     /// resolves its own set by longest-prefix `scope` match
     /// (spec.md#creds-scope-match); the resolver lives in `pond::substrate`.
+    /// `[share].bucket` resolves against this same map (typically a distinct
+    /// `[creds.share]` entry, scoped to the share bucket).
     #[serde(default)]
     pub creds: BTreeMap<String, CredsSet>,
 }
@@ -382,6 +424,82 @@ pub fn creds_set_name_error(name: &str) -> String {
     )
 }
 
+/// `[share]`: `pond share`'s publishing destination. All fields optional -
+/// `pond share` bails with a clear message if `bucket`/`public_base_url` are
+/// unset when it actually needs them (mirrors `[storage]`, which is likewise
+/// unvalidated at load time). File-only: unlike `[storage]`/`[creds.*]`, this
+/// section has no `POND_*` env mirror (`env_mirror` only recognizes
+/// `storage_path` and `creds_*` - see spec.md#storage-env-mirror).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ShareConfig {
+    /// Publishing backend. Only `bucket` is implemented; the type exists so
+    /// an unimplemented value fails at config-load with serde's own
+    /// "unknown variant" error instead of a runtime `bail!`.
+    pub provider: Option<ShareProvider>,
+    /// Bucket URL (same grammar as `[storage].path`), resolved against
+    /// `[creds.<name>]` exactly like any other storage address. Not assumed
+    /// public - see `public_base_url` and `presign_expiry_hours`.
+    pub bucket: Option<String>,
+    /// Public origin that serves `bucket`'s contents, e.g.
+    /// `https://shares.example.com`. Combined with the generated share id to
+    /// form the printed URL: `{public_base_url}/{id}.{ext}`. Set this only if
+    /// `bucket` is genuinely public (or fronted by a CDN/custom domain) and a
+    /// permanent link is wanted. `None` (the default) means `bucket` is
+    /// treated as private: `pond share` instead prints a presigned GET URL
+    /// valid for `presign_expiry_hours`.
+    pub public_base_url: Option<String>,
+    /// How long a presigned URL stays valid when `public_base_url` is unset.
+    /// `None` = [`DEFAULT_SHARE_PRESIGN_EXPIRY_HOURS`] (48h). Ignored when
+    /// `public_base_url` is set (that link doesn't expire).
+    pub presign_expiry_hours: Option<u64>,
+    /// Artifact format. Only `html` is implemented in v1.
+    #[serde(default)]
+    pub viewer: ShareViewer,
+    /// Per-image cap for inline `data:` URIs in the HTML renderer; images
+    /// over this size fall back to a placeholder instead of ballooning the
+    /// artifact. Accepts the same forms as `[runtime]`'s byte-size fields
+    /// (`"2 MiB"` or a bare integer). `None` = a 2 MiB built-in default.
+    #[serde(default, deserialize_with = "deserialize_byte_size_opt")]
+    pub max_inline_image_bytes: Option<usize>,
+}
+
+/// Default presigned-URL lifetime for `[share]` publishes that don't set
+/// `public_base_url` - long enough to forward a link over Slack/email without
+/// it going stale mid-conversation, short enough that a leaked link doesn't
+/// stay live indefinitely.
+pub const DEFAULT_SHARE_PRESIGN_EXPIRY_HOURS: u64 = 48;
+
+impl ShareConfig {
+    /// Resolve `presign_expiry_hours` to a [`Duration`], applying the
+    /// [`DEFAULT_SHARE_PRESIGN_EXPIRY_HOURS`] default when unset.
+    pub fn presign_expiry(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.presign_expiry_hours
+                .unwrap_or(DEFAULT_SHARE_PRESIGN_EXPIRY_HOURS)
+                * 3600,
+        )
+    }
+}
+
+/// `[share].provider` values. Single-variant today; `GitHubPagesPublisher` /
+/// `SelfHostedPublisher` / `HostedPublisher` land as new variants later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareProvider {
+    #[default]
+    Bucket,
+}
+
+/// `[share].viewer` values. Single-variant today; `JsonRenderer` (hosted
+/// viewer) lands as a new variant later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareViewer {
+    #[default]
+    Html,
+}
+
 /// `[runtime]`: long-running process caps. Both knobs accept either a plain
 /// byte count or a `humansize`-style suffix (`"128 MiB"`, `"1 GiB"`). Both are
 /// optional - `None` lets `pond::substrate` pick the backend-aware default
@@ -441,6 +559,17 @@ pub struct EmbeddingsConfig {
     /// Output dimension of `model`. Must equal the model's `hidden_size`.
     /// Defaults to 384 (e5-small). Set to 768 for e5-base, 1024 for e5-large.
     pub dim: usize,
+    /// Whether `pond sync` embeds each new message inline at ingest. Off by
+    /// default: sync is a cheap message backup that writes null vectors, so it
+    /// never downloads the ~500 MB model, never touches the GPU, and never
+    /// blocks on embedding - it just captures your conversations. `pond
+    /// optimize` is the manual embed step that backfills those null-vector rows
+    /// later. Until it runs, search still works but degrades to keyword/FTS for
+    /// the un-embedded rows (vector search only scores rows that carry a
+    /// vector). Set `true` to restore embed-at-ingest, so every synced row is
+    /// immediately vector-searchable at the cost of the model download and the
+    /// per-message embedding work on the sync's critical path.
+    pub embed_on_sync: bool,
 }
 
 impl Default for EmbeddingsConfig {
@@ -448,6 +577,7 @@ impl Default for EmbeddingsConfig {
         Self {
             model: crate::embed::DEFAULT_MODEL_ID.to_owned(),
             dim: crate::sessions::DEFAULT_EMBEDDING_DIM,
+            embed_on_sync: false,
         }
     }
 }
@@ -913,6 +1043,7 @@ mod tests {
         let bad_model = EmbeddingsConfig {
             model: "   ".to_owned(),
             dim: 768,
+            embed_on_sync: false,
         };
         assert!(bad_model.validate().is_err());
         // Non-multiple-of-8 dims are accepted now: IVF_SQ has no subspace
@@ -920,12 +1051,14 @@ mod tests {
         let odd_dim = EmbeddingsConfig {
             model: "intfloat/multilingual-e5-base".to_owned(),
             dim: 100,
+            embed_on_sync: false,
         };
         assert!(odd_dim.validate().is_ok());
         // Zero is still rejected.
         let zero_dim = EmbeddingsConfig {
             model: "intfloat/multilingual-e5-base".to_owned(),
             dim: 0,
+            embed_on_sync: false,
         };
         assert!(zero_dim.validate().is_err());
     }
@@ -1313,6 +1446,139 @@ region        = "file-region"
             assert_eq!(work.region.as_deref(), Some("file-region"));
             assert_eq!(work.scope.as_deref(), Some("s3://file-bucket/"));
             assert_eq!(config.creds["ci"].access_key_id.as_deref(), Some("ci-key"));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn share_config_parses_with_distinct_creds_scope() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                r#"
+[storage]
+path = "s3+https://acct.example.com/pond-data"
+
+[creds.default]
+access_key_id     = "data-key"
+secret_access_key = "data-secret"
+
+[share]
+provider        = "bucket"
+bucket          = "s3+https://acct.example.com/pond-shares"
+public_base_url = "https://shares.example.com"
+viewer          = "html"
+max_inline_image_bytes = "2 MiB"
+
+[creds.share]
+scope             = "s3+https://acct.example.com/pond-shares"
+access_key_id     = "share-key"
+secret_access_key = "share-secret"
+"#,
+            )?;
+            let config = Config::load("config.toml").expect("config loads");
+            assert_eq!(config.share.provider, Some(ShareProvider::Bucket));
+            assert_eq!(
+                config.share.bucket.as_deref(),
+                Some("s3+https://acct.example.com/pond-shares"),
+            );
+            assert_eq!(
+                config.share.public_base_url.as_deref(),
+                Some("https://shares.example.com"),
+            );
+            assert_eq!(config.share.viewer, ShareViewer::Html);
+            assert_eq!(config.share.max_inline_image_bytes, Some(2 * 1024 * 1024));
+
+            // The data URL resolves to [creds.default]; the share URL resolves
+            // to the separate, more-specifically-scoped [creds.share] - same
+            // resolver, same map, two independent scope matches.
+            let data_url = crate::substrate::StorageUrl::parse(
+                config.storage.path.as_deref().expect("storage path"),
+            )
+            .expect("data url parses");
+            let data_resolved = data_url.resolve(&config.creds).expect("data resolves");
+            assert_eq!(
+                data_resolved
+                    .options
+                    .get("access_key_id")
+                    .map(String::as_str),
+                Some("data-key"),
+            );
+
+            let share_url =
+                crate::substrate::StorageUrl::parse(config.share.bucket.as_deref().unwrap())
+                    .expect("share url parses");
+            let share_resolved = share_url.resolve(&config.creds).expect("share resolves");
+            assert_eq!(
+                share_resolved
+                    .options
+                    .get("access_key_id")
+                    .map(String::as_str),
+                Some("share-key"),
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn share_config_rejects_unknown_fields_and_bad_viewer() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("config.toml", "[share]\nbuckett = \"typo\"\n")?;
+            let err = Config::load("config.toml")
+                .expect_err("typo'd field must error")
+                .to_string();
+            assert!(err.contains("buckett"), "got: {err}");
+
+            jail.create_file("config.toml", "[share]\nviewer = \"json\"\n")?;
+            let err = Config::load("config.toml")
+                .expect_err("unimplemented viewer must error")
+                .to_string();
+            assert!(err.contains("json"), "got: {err}");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn share_config_has_no_env_mirror() {
+        // [share] is file-only in v1 (env_mirror only recognizes storage_path
+        // and creds_* - see the doc comment on ShareConfig). A POND_SHARE_*
+        // var must be silently ignored, not error and not override the file.
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                "[share]\nbucket = \"s3://from-file/shares\"\n",
+            )?;
+            jail.set_env("POND_SHARE_BUCKET", "s3://from-env/shares");
+            let config = Config::load("config.toml").expect("config loads");
+            assert_eq!(
+                config.share.bucket.as_deref(),
+                Some("s3://from-file/shares"),
+                "POND_SHARE_BUCKET must not reach [share] - no env mirror in v1",
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn share_creds_still_get_the_existing_creds_env_mirror() {
+        // [creds.share] is just another entry in the existing creds map, so
+        // it rides the pre-existing POND_CREDS_<NAME>_<FIELD> mirror for free
+        // even though [share] itself has none.
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                r#"
+[creds.share]
+scope         = "s3://shares/"
+access_key_id = "from-file"
+"#,
+            )?;
+            jail.set_env("POND_CREDS_SHARE_ACCESS_KEY_ID", "from-env");
+            let config = Config::load("config.toml").expect("config loads");
+            assert_eq!(
+                config.creds["share"].access_key_id.as_deref(),
+                Some("from-env"),
+            );
             Ok(())
         });
     }

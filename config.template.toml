@@ -1,0 +1,67 @@
+# pond config.toml template - "copy one file and go" for a second machine
+# pointed at the SAME bucket as your first one.
+#
+# This file is safe to copy, commit to a private dotfiles repo, or paste into
+# a chat: it carries no secrets. Credentials come from environment variables
+# instead (see the block at the bottom). For the full annotated reference of
+# every key pond understands, run `pond config schema`.
+#
+# No embeddings happen from this config. `pond sync` writes plain rows with
+# null vectors by default ([embeddings].embed_on_sync is false unless you set
+# it) - this file doesn't set it, so it stays off. A scheduled `pond sync`
+# (from `pond schedule`) honors the same default, so it doesn't embed either.
+# Embedding only happens when you explicitly run `pond optimize`, or set
+# `embed_on_sync = true`. Full-text search works immediately either way.
+
+# ---------------------------------------------------------------------------
+# Storage: point this at the bucket your OTHER machine already backs up to.
+# Same bucket = this machine's sessions land in the same store, alongside the
+# ones already there - `pond sync` is idempotent and content-addressed, so
+# there's no risk of clobbering or duplicating what's already synced.
+# ---------------------------------------------------------------------------
+[storage]
+# EDIT ME: same bucket as your other machine.
+#   s3+https://<host>/<bucket>/<prefix>   S3-compatible endpoint (Hetzner, R2, B2, MinIO)
+#   s3://<bucket>/<prefix>                AWS S3 (ambient credential chain)
+#   gs://<bucket>/<prefix>                Google Cloud Storage
+#   az://<account>/<container>/<prefix>   Azure Blob
+path = "s3+https://<host>/<bucket>/<prefix>"
+
+# ---------------------------------------------------------------------------
+# Adapters: where this machine's agent CLIs keep their session history.
+# Defaults match each tool's standard install location; edit `path` only if
+# yours differs (e.g. a custom CLAUDE_CONFIG_DIR).
+# ---------------------------------------------------------------------------
+[adapters.claude-code]
+enabled = true
+path = "~/.claude/projects"
+
+[adapters.codex-cli]
+enabled = true
+path = "~/.codex/sessions"
+
+# ---------------------------------------------------------------------------
+# Embeddings: left unset on purpose. `pond sync` never embeds by default -
+# this section only matters if you later opt in to embed-at-ingest. See
+# `pond config schema` for the model/dim knobs.
+# ---------------------------------------------------------------------------
+# [embeddings]
+# embed_on_sync = false   # the default; uncomment only to be explicit
+
+# ---------------------------------------------------------------------------
+# Credentials: DO NOT put access keys in this file. Set them as environment
+# variables on this machine instead - pond's POND_* env mirror maps straight
+# onto a [creds.default] set (the catch-all credential set: no `scope` means
+# it matches any storage URL):
+#
+#   export POND_CREDS_DEFAULT_ACCESS_KEY_ID="..."
+#   export POND_CREDS_DEFAULT_SECRET_ACCESS_KEY="..."
+#
+# Optional, if your bucket needs them:
+#   export POND_CREDS_DEFAULT_REGION="..."
+#   export POND_CREDS_DEFAULT_VIRTUAL_HOSTED_STYLE_REQUEST="true"
+#
+# Precedence: CLI flag > POND_* env > this file > ambient cloud credential
+# chain. `scripts/install-pond.sh` prints these export lines for you; put
+# them in your shell profile (~/.zshrc, ~/.bashrc) or a secrets manager, not
+# in this file. Verify they resolve with `pond storage check`.

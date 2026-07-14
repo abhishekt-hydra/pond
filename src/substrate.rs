@@ -16,7 +16,9 @@ use lance::dataset::optimize::{
 };
 pub use lance::dataset::write::merge_insert::MergeStats;
 use lance::dataset::write::merge_insert::SourceDedupeBehavior;
-use lance::dataset::{InsertBuilder, MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode};
+use lance::dataset::{
+    InsertBuilder, MergeInsertBuilder, UpdateBuilder, WhenMatched, WhenNotMatched, WriteMode,
+};
 pub use lance::dataset::{WriteParams, WriteStats};
 use lance::deps::arrow_array::{Array, RecordBatch, RecordBatchIterator, StringArray};
 use lance::deps::datafusion::physical_plan::SendableRecordBatchStream;
@@ -2065,6 +2067,51 @@ impl Handle {
         )
         .await
         .map(|stats| stats.num_inserted_rows + stats.num_updated_rows)
+    }
+
+    /// Overwrite `columns` with `NULL` on every row matching `filter` (a Lance
+    /// filter string, e.g. [`Predicate::to_lance`]). Used by `pond optimize
+    /// --clear-embeddings` to reset `messages.vector`/`embedding_model` back to
+    /// the null state a no-embed `pond sync` produces. This is Lance's
+    /// `UpdateBuilder` (a SQL-ish `SET col = expr WHERE ...`), not
+    /// [`Self::merge_update`]: nulling doesn't need a source batch keyed by PK -
+    /// `UpdateBuilder` rewrites only the rows the filter matches, in place, off
+    /// the dataset's own scan, which is both simpler and cheaper than reading
+    /// every row back out just to write it forward with one column zeroed.
+    /// Counts eligible rows first and returns early on zero so a repeat run (or
+    /// a store with nothing to clear) is a true no-op - no empty manifest
+    /// version, no wasted commit.
+    pub(crate) async fn null_columns(
+        &self,
+        table: Table,
+        filter: &str,
+        columns: &[&'static str],
+    ) -> Result<u64> {
+        let mut guard = self.cached(table).await?.lock().await;
+        let dataset = guard.latest().await?;
+        let eligible = dataset
+            .count_rows(Some(filter.to_owned()))
+            .await
+            .with_context(|| format!("count_rows({filter:?}) failed for {}", table.label()))?;
+        if eligible == 0 {
+            return Ok(0);
+        }
+        let mut builder = UpdateBuilder::new(Arc::new(dataset))
+            .update_where(filter)
+            .with_context(|| format!("update_where({filter:?}) failed for {}", table.label()))?;
+        for column in columns {
+            builder = builder
+                .set(*column, "NULL")
+                .with_context(|| format!("set({column}, NULL) failed for {}", table.label()))?;
+        }
+        let result = builder
+            .build()
+            .with_context(|| format!("build update({columns:?}) failed for {}", table.label()))?
+            .execute()
+            .await
+            .with_context(|| format!("update({columns:?}) failed for {}", table.label()))?;
+        guard.replace(result.new_dataset.as_ref().clone());
+        Ok(result.rows_updated)
     }
 
     /// The OCC write-commit seam (spec.md#lance-chokepoints-write): every write -
